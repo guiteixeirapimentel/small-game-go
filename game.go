@@ -12,7 +12,6 @@ import (
 	"image/draw"
 	_ "image/png"
 	"log"
-	"math/rand/v2"
 	"os"
 	"runtime"
 	"strings"
@@ -21,6 +20,17 @@ import (
 	"github.com/go-gl/glfw/v3.3/glfw"
 	"github.com/go-gl/mathgl/mgl32"
 )
+
+type numbers interface {
+	int | int8 | int16 | int32 | int64 | float32 | float64
+}
+
+func Abs[T numbers](x T) T {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
 
 const windowWidth = 800
 const windowHeight = 600
@@ -55,15 +65,32 @@ func make_bounding_box_2d_xy(x_min float32, x_max float32, y_min float32, y_max 
 	return BoundingBox2D{Vector2DF{x_min, y_max}, Vector2DF{x_max, y_min}}
 }
 
+func (bb BoundingBox2D) intersects_with(other_bb BoundingBox2D) bool {
+	return other_bb.top_left.x < bb.bottom_right.x && other_bb.bottom_right.x > bb.top_left.x &&
+		other_bb.bottom_right.y < bb.top_left.y && other_bb.top_left.y > bb.bottom_right.y
+}
+
+type PlayerState int32
+
+const (
+	FALLING = iota
+	RUNNING
+)
+
 type Player struct {
 	pos   Vector2DF
 	vel   Vector2DF
 	accel Vector2DF
 
+	angle_z float32
+
 	vao uint32
 	vbo uint32
+	bb  BoundingBox2D
 
 	texture uint32
+
+	state PlayerState
 }
 
 type Camera struct {
@@ -120,10 +147,16 @@ func init_player(program uint32) {
 	g_Player.texture = texture
 
 	config_vertex_data(program)
+
+	g_Player.state = RUNNING
+
+	g_Player.angle_z = 0
 }
 
 func render_player(model_uniform_location int32) {
 	model := mgl32.Translate3D(g_Player.pos.x, g_Player.pos.y, 0)
+
+	model = model.Mul4(mgl32.HomogRotate3D(g_Player.angle_z, mgl32.Vec3{0, 0, 1}))
 
 	gl.UniformMatrix4fv(model_uniform_location, 1, false, &model[0])
 
@@ -133,6 +166,71 @@ func render_player(model_uniform_location int32) {
 	gl.BindTexture(gl.TEXTURE_2D, g_Player.texture)
 
 	gl.DrawArrays(gl.TRIANGLES, 0, 6*2*3)
+}
+
+func player_jump() {
+	if g_Player.state != RUNNING {
+		return
+	}
+
+	g_Player.vel.y += float32(20)
+
+	g_Player.state = FALLING
+}
+
+func player_move_right() {
+	if g_Player.state == RUNNING {
+		g_Player.accel.x += 100
+	} else {
+		g_Player.vel.x = +Abs(g_Player.vel.x)
+	}
+}
+
+func player_move_left() {
+	if g_Player.state == RUNNING {
+		g_Player.accel.x -= 100
+	} else {
+		g_Player.vel.x = -Abs(g_Player.vel.x)
+	}
+}
+
+func handle_player_map_colision(map_entity StaticMapEntity) bool {
+	left_insertion := Abs(map_entity.bb.top_left.x - g_Player.bb.bottom_right.x)
+	right_insertion := Abs(map_entity.bb.bottom_right.x - g_Player.bb.top_left.x)
+
+	top_insertion := Abs(map_entity.bb.top_left.y - g_Player.bb.bottom_right.y)
+	bottom_insertion := Abs(map_entity.bb.bottom_right.y - g_Player.bb.top_left.y)
+
+	min_vertical := Abs(min(top_insertion, bottom_insertion))
+	min_horizontal := Abs(min(left_insertion, right_insertion))
+
+	should_fall := true
+
+	if min_horizontal < min_vertical {
+		if left_insertion < 0 || right_insertion < 0 || true {
+			g_Player.vel.x = 0
+			if left_insertion < right_insertion {
+				g_Player.pos.x -= left_insertion // Hitting from left
+			} else {
+				g_Player.pos.x += right_insertion
+			}
+		}
+	} else {
+		if top_insertion < 0 || bottom_insertion < 0 || true {
+			g_Player.vel.y = 0
+
+			if top_insertion < bottom_insertion {
+				g_Player.pos.y += top_insertion // Hitting from above (Feet first)
+				should_fall = false
+				if g_Player.state == FALLING {
+					g_Player.state = RUNNING
+				}
+			} else {
+				g_Player.pos.y -= bottom_insertion // Hitting from below (Head first)
+			}
+		}
+	}
+	return should_fall
 }
 
 func render_map(model_uniform_location int32) {
@@ -153,9 +251,29 @@ func step_player(dt float32) {
 	g_Player.vel = g_Player.vel.add(g_Player.accel.mul_scalar(dt))
 	g_Player.pos = g_Player.pos.add(g_Player.vel.mul_scalar(dt))
 
-	g_Player.vel = g_Player.vel.mul_scalar(0.85)
+	gravity_accel := float32(-50)
+
+	switch g_Player.state {
+	case FALLING:
+		g_Player.vel.y += gravity_accel * dt
+
+		falling_rotation := float32(0)
+		if g_Player.vel.x > 0 {
+			falling_rotation = float32(-1.5)
+		} else if g_Player.vel.x < 0 {
+			falling_rotation = float32(1.5)
+		} else {
+			g_Player.angle_z = 0
+		}
+		g_Player.angle_z += dt * falling_rotation
+	case RUNNING:
+		g_Player.vel = g_Player.vel.mul_scalar(0.85)
+		g_Player.angle_z = 0
+	}
 
 	g_Player.accel = Vector2DF{0, 0}
+
+	g_Player.bb = make_bounding_box_2d_vec(g_Player.pos.add(Vector2DF{-1, 1}), g_Player.pos.add(Vector2DF{1, -1}))
 }
 
 func init_camera() {
@@ -185,8 +303,6 @@ func init_map(program uint32) {
 	gl.GenVertexArrays(1, &g_Map.cube_vao)
 	gl.BindVertexArray(g_Map.cube_vao)
 
-	fmt.Printf("g_Map.cube_vao %d\n", g_Map.cube_vao)
-
 	gl.GenBuffers(1, &g_Map.cube_vbo)
 	gl.BindBuffer(gl.ARRAY_BUFFER, g_Map.cube_vbo)
 	gl.BufferData(gl.ARRAY_BUFFER, len(cubeVerticesMap)*4, gl.Ptr(cubeVerticesMap), gl.STATIC_DRAW)
@@ -195,16 +311,60 @@ func init_map(program uint32) {
 
 	g_Map.angle = 0
 
-	for i := -10; i < 10; i++ {
-		block := make_static_map_entity(Vector2DF{float32(i) * rand.Float32(), float32(i) * rand.Float32()}, make_bounding_box_2d_xy(0, 2, 0, 2), "square.png")
+	for i := 0; i < 20; i += 5 {
+		{
+			pos := Vector2DF{float32(i * 3), -6.0}
+			bb := make_bounding_box_2d_vec(pos.add(Vector2DF{-1.0, 1.0}), pos.add(Vector2DF{1.0, -1.0}))
+			block := make_static_map_entity(pos, bb, "square.png")
 
-		g_Map.entities = append(g_Map.entities, block)
+			g_Map.entities = append(g_Map.entities, block)
+		}
+		{
+			pos := Vector2DF{float32(i*3) + 2, -6.0}
+			bb := make_bounding_box_2d_vec(pos.add(Vector2DF{-1.0, 1.0}), pos.add(Vector2DF{1.0, -1.0}))
+			block := make_static_map_entity(pos, bb, "square.png")
+
+			g_Map.entities = append(g_Map.entities, block)
+		}
+		{
+			pos := Vector2DF{float32(i*3) + 4, -6.0}
+			bb := make_bounding_box_2d_vec(pos.add(Vector2DF{-1.0, 1.0}), pos.add(Vector2DF{1.0, -1.0}))
+			block := make_static_map_entity(pos, bb, "square.png")
+
+			g_Map.entities = append(g_Map.entities, block)
+		}
+		{
+			pos := Vector2DF{float32(i*3) + 6, -6.0}
+			bb := make_bounding_box_2d_vec(pos.add(Vector2DF{-1.0, 1.0}), pos.add(Vector2DF{1.0, -1.0}))
+			block := make_static_map_entity(pos, bb, "square.png")
+
+			g_Map.entities = append(g_Map.entities, block)
+		}
+		{
+			pos := Vector2DF{float32(i*3) + 8, -6.0}
+			bb := make_bounding_box_2d_vec(pos.add(Vector2DF{-1.0, 1.0}), pos.add(Vector2DF{1.0, -1.0}))
+			block := make_static_map_entity(pos, bb, "square.png")
+
+			g_Map.entities = append(g_Map.entities, block)
+		}
 	}
 
 }
 
 func step_map(dt float32) {
 	g_Map.angle += dt
+
+	should_fall := true
+
+	for _, block := range g_Map.entities {
+		if block.bb.intersects_with(g_Player.bb) {
+			should_fall = handle_player_map_colision(block)
+		}
+	}
+
+	if should_fall {
+		g_Player.state = FALLING
+	}
 }
 
 func init() {
@@ -316,10 +476,13 @@ func main() {
 			g_Player.accel = g_Player.accel.add(Vector2DF{0.0, -add_accel})
 		}
 		if window.GetKey(glfw.KeyLeft) == glfw.Press {
-			g_Player.accel = g_Player.accel.add(Vector2DF{-add_accel, 0.0})
+			player_move_left()
 		}
 		if window.GetKey(glfw.KeyRight) == glfw.Press {
-			g_Player.accel = g_Player.accel.add(Vector2DF{add_accel, 0.0})
+			player_move_right()
+		}
+		if window.GetKey(glfw.KeySpace) == glfw.Press {
+			player_jump()
 		}
 
 		glfw.PollEvents()
